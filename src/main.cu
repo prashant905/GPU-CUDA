@@ -17,12 +17,16 @@
 
 #include "tum_benchmark.hpp"
 
-
+#include "upSampling.cuh"
+#include "upSampling_cpu.cuh"
+#include "depth_fusion.cuh"
+#include "depth_fusion_cpu.cuh"
 #include "convolution.cuh"
 #include "global.cuh"
 
+#include "depthToMesh.hpp"
 
-
+#include "save_ply.hpp"
 
 #define STR1(x)  #x
 #define STR(x)  STR1(x)
@@ -360,6 +364,22 @@ int main(int argc, char *argv[])
 			CUDA_CHECK;
 			#endif
 
+//	        transformDepthFloatToInt(d_depth_dataSR, d_i_depth_dataSR, wSR, hSR);
+
+			#ifdef CPU
+			cpu::upsampleColor(h_data_colorSR, lrDataColor, wSR, hSR, nc, s);
+			cpu::upsampleDepth(h_depth_dataSR, lrDataDepth, wSR, hSR, s);
+			cpu::initSRDepthAndWeights(h_depth_dataSR, h_weights_SR, wSR, hSR);
+			#endif
+
+			// Visualize new keyframe
+			#ifndef CPU
+			cudaMemcpy(srDataDepth, d_depth_dataSR, wSR * hSR * sizeof(float), cudaMemcpyDeviceToHost);
+    		CUDA_CHECK;
+			cudaMemcpy(srDataColor, d_color_dataSR, wSR * hSR * nc * sizeof(float), cudaMemcpyDeviceToHost);
+    		CUDA_CHECK;
+//			convert_layered_to_mat(srColor, srDataColor);
+			#endif
 
 
 
@@ -367,7 +387,42 @@ int main(int argc, char *argv[])
 			memcpy(srDataDepth, h_depth_dataSR, wSR * hSR * sizeof(float));
 			#endif
 
-    	
+    		for (int j=0; j<wSR*hSR; ++j){
+    			srDataDepth[j] /= 5.0f;
+    		}
+
+			convert_layered_to_mat(srDepth, srDataDepth);
+			std::cout << "Set new keyframe to frame number " << (int)i << std::endl;
+			
+			// Save upsampled input color and depth image
+			fileName.str("");
+			fileName << i;
+			fileName << "_";
+			fileName << h_maxColorDiffChannel;
+			fileName << "_";
+			fileName << h_maxColorDiffSum;
+			fileName << "_";
+			fileName << h_epsilonAveraging;
+			fileName << "_";
+			fileName << h_epsilonOverwriting;
+			fileName << ".png";
+
+			cv::imwrite(resultFolder + "inputColor_" + fileName.str(), srColor*255.f);
+    		cv::imwrite(resultFolder + "inputDepth_" + fileName.str(), srDepth*255.f);
+			
+			showImage("KeyFrame-Color", srColor, 100, 100);
+    		showImage("KeyFrame-Depth", srDepth, 100+wLR+40, 100);
+			cv::waitKey(0);
+		} // end of loading key frame
+
+		// comment in to write mesh file
+//		if(i >= 0){
+//
+//			ss.str("");
+//			ss << outputFolder << "mesh_" << std::setw(5) << std::setfill('0') << i << ".ply";
+//			depthToVertexMap(K, srDepth, vertexMap);
+//			srColor.convertTo(color2, CV_8UC3, 255.0);
+//			savePlyFile(ss.str(), color2, vertexMap);
 //
 //			Eigen::Matrix3f K2 = Eigen::Matrix3f(K);
 //			K2(0,0) *= s;
@@ -441,9 +496,34 @@ int main(int argc, char *argv[])
 			#ifdef CPU
 			cpu::init_T_inv_LR(pose_lr, MAX_FRAMES);
 			cpu::init_T_LR(pose_inv_lr, MAX_FRAMES);
-			
+			// Start timer CPU
+			std::cout << "Fuse Depth and weights with ray median" << std::endl; 
+			timer.start();
+			cpu::fuseDepthAndWeightsWithRayMedian(h_depth_dataSR, h_weights_SR, lrDataDepth, h_data_colorSR, lrDataColor, BlurrFactors, MAX_FRAMES, s, wSR, hSR);
+			timer.end();
+			std::cout << "CPU-Time (fuseDepthAndWeightsWithRayMedian): " << timer.get() << std::endl;
+			// End timer CPU
+			memcpy(srDataDepth, h_depth_dataSR, wSR * hSR * sizeof(float));
+			convert_layered_to_mat(srColor, h_data_colorSR);
+			#else
+			init_T_LR(pose_inv_lr, MAX_FRAMES);
+			CUDA_CHECK;
+			init_T_inv_LR(pose_lr, MAX_FRAMES);
+			CUDA_CHECK;
 
-			
+			float* d_BlurrFactors;
+			cudaMalloc(&d_BlurrFactors, MAX_FRAMES * sizeof(float));
+			CUDA_CHECK;
+			cudaMemcpy(d_BlurrFactors, BlurrFactors, MAX_FRAMES * sizeof(float), cudaMemcpyHostToDevice);
+			CUDA_CHECK;
+			// Start timer GPU
+			timer.start();
+			fuseDepthAndWeightsWithRayMedian(d_depth_dataSR, d_weightsSR, d_depth_data, d_color_dataSR, d_color_data, d_BlurrFactors, MAX_FRAMES, s, wSR, hSR);
+			CUDA_CHECK;
+			timer.end();
+			std::cout << "GPU-Time (fuseDepthAndWeightsWithRayMedian) " << timer.get() << std::endl;
+			// End timer GPU
+			// output
 			cudaMemcpy(srDataColor, d_color_dataSR, wSR * hSR * nc * sizeof(float), cudaMemcpyDeviceToHost);
 			CUDA_CHECK;
 			cudaMemcpy(srDataDepth, d_depth_dataSR, wSR * hSR * sizeof(float), cudaMemcpyDeviceToHost);
